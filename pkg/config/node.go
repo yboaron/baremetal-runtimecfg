@@ -300,13 +300,11 @@ func GetConfig(kubeconfigPath, clusterConfigPath, resolvConfPath string, apiVip 
 	prefix, _ := nonVipAddr.Mask.Size()
 	node.Cluster.VIPNetmask = prefix
 	node.VRRPInterface = vipIface.Name
-
-	domain := fmt.Sprintf("%s.%s", clusterName, clusterDomain)
-	node.LBConfig, err = GetLBConfig(domain, apiPort, lbPort, statPort, apiVip)
+	node.LBConfig, err = GetLBConfig(kubeconfigPath, apiPort, lbPort, statPort, apiVip)
 	if err != nil {
 		return node, err
 	}
-	etcdBackends, err := getSortedBackends(domain)
+	etcdBackends, err := getSortedBackends(kubeconfigPath)
 	if err != nil {
 		return node, err
 	}
@@ -320,37 +318,61 @@ func GetConfig(kubeconfigPath, clusterConfigPath, resolvConfPath string, apiVip 
 	return node, err
 }
 
-func getSortedBackends(domain string) (backends []Backend, err error) {
-	srvs, err := utils.GetEtcdSRVMembers(domain)
+func getSortedBackends(kubeconfigPath string) (backends []Backend, err error) {
+	var masterIp string
+
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
 	if err != nil {
 		log.WithFields(logrus.Fields{
 			"err": err,
-		}).Info("Failed to get Etcd SRV members")
-		srvs = []*net.SRV{}
-		err = nil
+		}).Info("Failed to get client config")
+		return []Backend{}, err
 	}
-
-	for _, srv := range srvs {
-		addr, err := utils.GetFirstAddr(srv.Target)
-		if err != nil {
-			log.WithFields(logrus.Fields{
-				"member": srv.Target,
-			}).Error("Failed to get address for member")
-			continue
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"err": err,
+		}).Info("Failed to get client")
+		return []Backend{}, err
+	}
+	nodes, err := clientset.CoreV1().Nodes().List(metav1.ListOptions{
+		LabelSelector: "node-role.kubernetes.io/master=",
+	})
+	if err != nil {
+		log.WithFields(logrus.Fields{
+			"err": err,
+		}).Info("Failed to get master Nodes list")
+		return []Backend{}, err
+	}
+	for _, node := range nodes.Items {
+		masterIp = ""
+		for _, address := range node.Status.Addresses {
+			if address.Type == v1.NodeInternalIP {
+				masterIp = address.Address
+				break
+			}
 		}
-
-		// Do a reverse lookup to get the canonical hostname as well
-		canonicalHost, err := utils.GetFirstHost(addr)
-		canonicalShortName := utils.GetShortHostname(canonicalHost)
-		backends = append(backends, Backend{Host: srv.Target, Address: addr, Port: srv.Port, CanonicalHost: canonicalHost, CanonicalShortName: canonicalShortName})
+		if masterIp != "" {
+			// Do a reverse lookup to get the canonical hostname as well
+			canonicalHost, err := utils.GetFirstHost(masterIp)
+			if err != nil {
+				log.WithFields(logrus.Fields{
+					"masterIp": masterIp,
+				}).Info("Failed to resolve canonicalName")
+				continue
+			}
+			canonicalShortName := utils.GetShortHostname(canonicalHost)
+			backends = append(backends, Backend{Host: node.ObjectMeta.Name, Address: masterIp, CanonicalHost: canonicalHost, CanonicalShortName: canonicalShortName})
+		}
 	}
+
 	sort.Slice(backends, func(i, j int) bool {
 		return backends[i].Address < backends[j].Address
 	})
 	return backends, err
 }
 
-func GetLBConfig(domain string, apiPort, lbPort, statPort uint16, apiVip net.IP) (ApiLBConfig, error) {
+func GetLBConfig(kubeconfigPath string, apiPort, lbPort, statPort uint16, apiVip net.IP) (ApiLBConfig, error) {
 	config := ApiLBConfig{
 		ApiPort:  apiPort,
 		LbPort:   lbPort,
@@ -361,10 +383,10 @@ func GetLBConfig(domain string, apiPort, lbPort, statPort uint16, apiVip net.IP)
 		config.FrontendAddr = "::"
 	}
 
-	backends, err := getSortedBackends(domain)
+	backends, err := getSortedBackends(kubeconfigPath)
 	if err != nil {
 		log.WithFields(logrus.Fields{
-			"domain": domain,
+			"kubeconfigPath": kubeconfigPath,
 		}).Error("Failed to retrieve API member information")
 		return config, err
 	}
