@@ -145,20 +145,24 @@ func isModeUpdateNeeded(cfgPath string) (bool, modeUpdateInfo) {
 
 func handleBootstrapStopKeepalived(kubeconfigPath string, bootstrapStopKeepalived chan bool) {
 	consecutiveErr := 0
+	apiIsOperational := false
 
-	/* It could take up to ~20 seconds for the local kube-apiserver to start running on the bootstrap node,
+	/* It could take up to ~180 seconds for the local kube-apiserver to start running on the bootstrap node,
 	so before checking if kube-apiserver is not operational we should verify (with a timeout of 30 seconds)
 	first that it's operational. */
 	log.Info("handleBootstrapStopKeepalived: verify first that local kube-apiserver is operational")
-	for start := time.Now(); time.Since(start) < time.Second*30; {
+	for start := time.Now(); time.Since(start) < time.Second*180; {
 		if _, err := config.GetIngressConfig(kubeconfigPath); err == nil {
 			log.Info("handleBootstrapStopKeepalived: local kube-apiserver is operational")
+			apiIsOperational = true
 			break
 		}
 		log.Info("handleBootstrapStopKeepalived: local kube-apiserver still not operational")
 		time.Sleep(3 * time.Second)
 	}
-
+	if !apiIsOperational {
+		log.Error("handleBootstrapStopKeepalived: local API is not operational after timeout")
+	}
 	for {
 		if _, err := config.GetIngressConfig(kubeconfigPath); err != nil {
 			consecutiveErr++
@@ -166,6 +170,9 @@ func handleBootstrapStopKeepalived(kubeconfigPath string, bootstrapStopKeepalive
 				"consecutiveErr": consecutiveErr,
 			}).Info("handleBootstrapStopKeepalived: detect failure on API")
 		} else {
+			if consecutiveErr > bootstrapApiFailuresThreshold { // Means it was stopped
+				log.Info("YOBO YOBO API is valid again **************")
+			}
 			consecutiveErr = 0
 		}
 		if consecutiveErr > bootstrapApiFailuresThreshold {
@@ -174,7 +181,7 @@ func handleBootstrapStopKeepalived(kubeconfigPath string, bootstrapStopKeepalive
 				"bootstrapApiFailuresThreshold": bootstrapApiFailuresThreshold,
 			}).Info("handleBootstrapStopKeepalived: Num of failures exceeds threshold")
 			bootstrapStopKeepalived <- true
-			return
+
 		}
 		time.Sleep(1 * time.Second)
 	}
